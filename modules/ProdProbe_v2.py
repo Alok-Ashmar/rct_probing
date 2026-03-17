@@ -1,7 +1,6 @@
 import os
 import pytz
 import warnings
-from redis import Redis
 from bson import ObjectId
 from datetime import datetime
 from langsmith import traceable
@@ -12,7 +11,8 @@ from modules.ServerLogger import ServerLogger
 from langchain_core.messages import SystemMessage
 from models.Survey import Survey, Question, Experiment
 from utils.state_management import build_probe_state, apply_probe_state
-from modules.ProdNSightGenerator import NSIGHT, NSIGHT_v2
+from utils.redis_pool import get_redis
+from modules.ProdNSightGenerator import DetailedMetrics, ImmediateEvaluation, NSIGHT_v2
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
 from langchain_community.chat_message_histories import RedisChatMessageHistory
 
@@ -52,8 +52,11 @@ class Probe(LLMAdapter):
         self.simple_store = simple_store
         self.su_id = self.metadata.su_id
         self.qs_id = self.question.qs_id
-        self.__metric_llm__ = self.llm.with_structured_output(NSIGHT)
+        self.__immediate_eval_llm__ = self.llm.with_structured_output(ImmediateEvaluation)
+        self.__detailed_metrics_llm__ = self.llm.with_structured_output(DetailedMetrics)
         self.id = f"{self.metadata.su_id}:{self.question.qs_id}:{mo_id}"
+        self.relevance_threshold = self.question.config.relevance_threshold
+        self.relevance_prompt_added = False
 
         if self.question.config.min_probe > self.question.config.max_probe:
             self.invalid = True
@@ -62,7 +65,7 @@ class Probe(LLMAdapter):
             "REDIS_URL",
             "redis://localhost:6379/0"
         )
-        self._redis = Redis.from_url(self._history_redis_url)
+        self._redis = get_redis()
 
         self.__prompt_chunks__ = {
             "main-chk": """
@@ -103,6 +106,12 @@ class Probe(LLMAdapter):
                 Encourage Elaboration
                     - Provide hints and contexts subtly wherever required.
                     - Focus on visible evidence.
+            """,
+            "relevance-chk": """
+                The user's last response was irrelevant or did not make sense.
+                Without mentioning that it didn't make sense, ask a new concise follow-up question (max 15 words)
+                that tries to get them back on track or explores the original question from a different angle.
+                Do not repeat your previous question verbatim.
             """
         }
 
@@ -228,19 +237,19 @@ class Probe(LLMAdapter):
             self._history.add_ai_message(full_content)
 
 
-    def gen_streamed_follow_up(self, question: str, response: str) -> tuple[AsyncIterable[str], AsyncIterable[NSIGHT]]:
+    def gen_streamed_follow_up(self, question: str, response: str):
         next_counter = self.counter + 1
         user_text = f"Response {next_counter}. {response}"
         self._history.add_user_message(user_text)
         self.counter = next_counter
         prompt = ChatPromptTemplate.from_messages(self._history.messages)
         chain = prompt | self.llm
-        metric_chain = prompt | self.__metric_llm__
+        immediate_chain = prompt | self.__immediate_eval_llm__
+        detailed_chain = prompt | self.__detailed_metrics_llm__
 
         llm_stream: str = self._stream_with_history_update(chain, {})
-        
-        metric_llm_stream: NSIGHT = metric_chain.astream({})
-        return (llm_stream, metric_llm_stream)
+
+        return (llm_stream, immediate_chain.ainvoke({}), detailed_chain.ainvoke({}))
 
 
     def store_response(self, nsight_v2: NSIGHT_v2, session_no: int):

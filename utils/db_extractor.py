@@ -1,18 +1,19 @@
 import os
 import json
 from typing import Any
-from redis import Redis
 from bson import ObjectId
 from models.Survey import UserResponse
 from modules.MongoWrapper import monet_db
 from models.Survey import Survey, Experiment, Question
+from utils.redis_pool import get_redis
+from utils.state_management import survey_details_key
 
 experiment_collection = monet_db.get_collection("experiments")
 survey_collection = monet_db.get_collection("surveys")
 question_collection = monet_db.get_collection("surveys")
 
 def db_extract_survey_details(
-    client_response: UserResponse, redis_client: Redis
+    client_response: UserResponse,
 ) -> tuple[dict[str, Any] | None, str | None]:
     try:
         experiment_details = experiment_collection.find_one(
@@ -93,15 +94,26 @@ def db_extract_survey_details(
             "question": question.model_dump(mode="json"),
         }
 
-        redis_key = f"rct_probing:survey_details:{client_response.exp_id}:{client_response.su_id}:{client_response.qs_id}"
-        redis_ttl = int(os.environ.get("REDIS_TTL_SECONDS_SURVEY", 86400))
-        redis_payload = json.dumps(payload)
-        if redis_ttl > 0:
-            redis_client.setex(redis_key, redis_ttl, redis_payload)
-        else:
-            redis_client.set(redis_key, redis_payload)
-
         return payload, None
     except Exception as exc:
         return None, str(exc)
+
+
+async def cache_survey_details(client_response: UserResponse, payload: dict[str, Any]) -> None:
+    try:
+        redis_key = survey_details_key(
+            client_response.exp_id,
+            client_response.su_id,
+            client_response.qs_id,
+        )
+        redis_ttl = int(os.environ.get("REDIS_TTL_SECONDS_SURVEY", 86400))
+        redis_payload = json.dumps(payload)
+        redis = get_redis()
+        if redis_ttl > 0:
+            await redis.setex(redis_key, redis_ttl, redis_payload)
+        else:
+            await redis.set(redis_key, redis_payload)
+    except Exception:
+        # Cache failures should not block the websocket flow.
+        pass
     
