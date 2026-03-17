@@ -18,7 +18,7 @@ This is *intern AI server that exposing various intelligent services**.
 
 # FastAPI app initialization
 app = FastAPI(
-    root_path="/v1/" if os.environ.get("ENV") == "production" else "",
+    root_path="/rct_probing/" if os.environ.get("ENV") == "production" else "",
     title="Monet Networks AI Server",
     description=description,
     summary="Monet Networks AI server that exposes interface to various AI based models.",
