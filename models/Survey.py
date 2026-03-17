@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Optional
 from pydantic import BaseModel, Field, ConfigDict
-from .payload import LLMEnum, PyObjectId
+from .payload import PyObjectId
 
 class status(str, Enum):
     active = "active"

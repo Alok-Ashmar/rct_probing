@@ -1,11 +1,15 @@
-import os
 import json
-from redis import Redis
 from typing import Dict
 from models.Survey import UserResponse, Survey, Question, Experiment
 from modules.ServerLogger import ServerLogger
 from modules.ProdProbe_v2 import Probe, NSIGHT_v2
 from utils.db_extractor import db_extract_survey_details
+from utils.state_management import (
+    redis_client,
+    probe_state_key,
+    load_probe_state,
+    save_probe_state,
+)
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 websocket_router = APIRouter(prefix="/ws", tags=["websocket", "ai-qa"])
@@ -13,34 +17,9 @@ logger = ServerLogger()
 
 
 active_connections: Dict[str, WebSocket] = {}
-redis_client = Redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
-probe_state_ttl = int(os.environ.get("REDIS_TTL_SECONDS_SESSION", 3600))
 
-
-def _probe_state_key(exp_id: str, su_id: str, qs_id: str, mo_id: str) -> str:
-    return f"rct_probing:probe_state:{exp_id}:{su_id}:{qs_id}:{mo_id}"
-
-def _load_probe_state(key: str) -> dict:
-    try:
-        cached = redis_client.get(key)
-        if not cached:
-            return {}
-        return json.loads(cached)
-    except Exception as e:
-        logger.error("Failed to load probe state from Redis")
-        logger.error(e)
-        return {}
-
-def _save_probe_state(key: str, state: dict) -> None:
-    try:
-        payload = json.dumps(state)
-        if probe_state_ttl > 0:
-            redis_client.setex(key, probe_state_ttl, payload)
-        else:
-            redis_client.set(key, payload)
-    except Exception as e:
-        logger.error("Failed to save probe state to Redis")
-        logger.error(e)
+def _normalize_text(value: str) -> str:
+    return " ".join((value or "").split()).strip().casefold()
 
 @websocket_router.websocket("/ai-qa")
 async def websocket_ai_qa(websocket: WebSocket):
@@ -74,27 +53,41 @@ async def websocket_ai_qa(websocket: WebSocket):
 
             try:
                 probe = None
-                state_key = _probe_state_key(str(client_response.exp_id), str(client_response.su_id), str(client_response.qs_id), str(client_response.mo_id))
-                probe_state = _load_probe_state(state_key)
-                counter = int(probe_state.get("counter", 0))
-                ended = bool(probe_state.get("ended", False))
+                state_key = probe_state_key(str(client_response.exp_id), str(client_response.su_id), str(client_response.qs_id), str(client_response.mo_id))
+                probe_state = load_probe_state(state_key)
                 session_no = int(probe_state.get("session_no", 0))
                 simple_store = bool(probe_state.get("simple_store", True))
-                probe = Probe(mo_id=client_response.mo_id, metadata=survey, question=question, experiment=experiment, simple_store=simple_store, session_no=session_no)
+
+                probe = Probe(
+                    mo_id=client_response.mo_id, 
+                    metadata=survey, 
+                    question=question, 
+                    experiment=experiment, 
+                    simple_store=simple_store, 
+                    session_no=session_no
+                )
+
                 probe.apply_state(probe_state)
-                if (client_response.question or "").strip() == (question.question or "").strip():
-                    probe.clear_memory()                    
+                
+                if _normalize_text(client_response.question) == _normalize_text(question.question):
+                    probe.clear_memory()
                     session_no = probe.session_no + 1
-                    probe = Probe(mo_id=client_response.mo_id,metadata=survey,question=question,experiment=experiment,simple_store=simple_store,session_no=session_no)
+                    probe = Probe(
+                        mo_id=client_response.mo_id,
+                        metadata=survey,
+                        question=question,
+                        experiment=experiment,
+                        simple_store=simple_store,
+                        session_no=session_no
+                    )
                     probe.apply_state(
                         {
-                            "session_no": session_no, 
-                            "counter": counter, 
-                            "ended": ended, 
+                            "counter": 0,
+                            "ended": False,
                             "simple_store": simple_store
                         }
                     )
-                _save_probe_state(state_key, probe.to_state())
+                save_probe_state(state_key, probe.to_state())
 
                 # Generate follow-up using the probe
                 stream, metric_stream = probe.gen_streamed_follow_up(client_response.question, client_response.response)
@@ -134,11 +127,11 @@ async def websocket_ai_qa(websocket: WebSocket):
                         await websocket.send_json(final_response)
 
                 await websocket.send_json(ended_response)
-                _save_probe_state(state_key, probe.to_state())
+                save_probe_state(state_key, probe.to_state())
                 
                 if probe.simple_store:
                     nsight_v2 = NSIGHT_v2(**{**metric.model_dump(), "question": client_response.question, "response": client_response.response})
-                    probe.store_response(nsight_v2, session_no)
+                    probe.store_response(nsight_v2, probe.session_no)
 
             except Exception as e:
                 logger.error("Error in websocket AI QA:")

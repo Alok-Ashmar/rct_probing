@@ -11,6 +11,7 @@ from modules.MongoWrapper import monet_db
 from modules.ServerLogger import ServerLogger
 from langchain_core.messages import SystemMessage
 from models.Survey import Survey, Question, Experiment
+from utils.state_management import build_probe_state, apply_probe_state
 from modules.ProdNSightGenerator import NSIGHT, NSIGHT_v2
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
 from langchain_community.chat_message_histories import RedisChatMessageHistory
@@ -24,7 +25,7 @@ warnings.filterwarnings(
 india = pytz.timezone('Asia/Kolkata')
 logger = ServerLogger()
 
-rct_probe_responses = monet_db.get_collection("rct_probe_responses")
+probe_responses = monet_db.get_collection("probe_responses")
 
 class Probe(LLMAdapter):
 
@@ -199,28 +200,15 @@ class Probe(LLMAdapter):
             self._history.add_message(SystemMessage(content=self.__system_prompt__))
 
     def to_state(self) -> dict:
-        return {
-            "session_no": self.session_no,
-            "counter": self.counter,
-            "ended": self.ended,
-            "simple_store": self.simple_store,
-        }
+        return build_probe_state(
+            session_no=self.session_no,
+            counter=self.counter,
+            ended=self.ended,
+            simple_store=self.simple_store,
+        )
 
     def apply_state(self, state: dict):
-        if not state:
-            return
-        try:
-            self.counter = int(state.get("counter", self.counter))
-        except Exception:
-            pass
-        try:
-            self.ended = bool(state.get("ended", self.ended))
-        except Exception:
-            pass
-        try:
-            self.simple_store = bool(state.get("simple_store", self.simple_store))
-        except Exception:
-            pass
+        apply_probe_state(self, state)
 
     def clear_memory(self):
         try:
@@ -257,14 +245,14 @@ class Probe(LLMAdapter):
 
     def store_response(self, nsight_v2: NSIGHT_v2, session_no: int):
         now_india = datetime.now(india)
-        insert_one_res = rct_probe_responses.insert_one({
+        insert_one_res = probe_responses.insert_one({
             **nsight_v2.model_dump(),
             "ended": self.ended,
             "exp_id": self.experiment.exp_id,
-            "mo_id": self.mo_id,
+            "mo_id": ObjectId(self.mo_id),
             "su_id": self.su_id, 
             "qs_id": self.qs_id,
-            "qs_no": self.counter + 1,
+            "qs_no": self.counter,
             "created_at": now_india.isoformat(),
             "session_no": session_no,
         })
